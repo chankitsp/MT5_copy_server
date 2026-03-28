@@ -1,38 +1,45 @@
 # MT5 Copy Server
 
-โปรเจกต์นี้เป็นระบบ copy trade แบบง่ายระหว่าง API server และ MT5 follower
+โปรเจกต์นี้เป็นระบบ copy trade แบบง่ายสำหรับส่งคำสั่งจาก API server ไปยัง MT5 follower หลายเครื่อง
 
-- `server.py` รับ event `open` และ `close` ผ่าน HTTP API
-- `follower.py` ดึง event จาก server แล้วส่งคำสั่งเข้า MetaTrader 5
-- รองรับหลาย follower พร้อมกันด้วย `follower_id` แยกตามเครื่อง
+- `server.py` รับ event ผ่าน REST API และ push event ไปยัง follower ผ่าน WebSocket
+- `follower.py` เชื่อม WebSocket ค้างไว้ รับ event แบบ realtime แล้วส่งคำสั่งเข้า MetaTrader 5
+- รองรับหลาย follower ด้วย `follower_id` แยกตามแต่ละเครื่อง
 
 ## โครงสร้างไฟล์
 
 - `server.py` FastAPI server
 - `follower.py` MT5 follower client
+- `requirements.txt` รายการ Python libraries ที่ต้องติดตั้ง
 - `follower_state.json` state ของ follower สำหรับกัน event ซ้ำ
 
 ## การทำงานโดยย่อ
 
 1. ส่ง event ไปที่ `POST /events`
-2. follower แต่ละเครื่องดึง event ผ่าน `GET /pull?follower_id=...`
+2. server push event ไปยัง follower ที่เชื่อม WebSocket อยู่
 3. follower เปิดหรือปิด order ใน MT5
-4. follower ส่งผลกลับผ่าน `POST /ack`
+4. follower ส่ง `ack` กลับมาทาง WebSocket
+5. admin ตรวจสอบสถานะได้ผ่าน REST API
 
 ## ข้อกำหนด
 
 - Python 3.14 หรือใกล้เคียง
 - MetaTrader 5 Terminal
-- Python package:
-  - `fastapi`
-  - `uvicorn`
-  - `requests`
-  - `MetaTrader5`
 
-ติดตั้ง package:
+ติดตั้ง dependencies:
 
 ```powershell
-python -m pip install fastapi uvicorn requests MetaTrader5
+python -m pip install -r requirements.txt
+```
+
+ไฟล์ [requirements.txt](/D:/Coding/MT5_copy_server/requirements.txt) มีรายการดังนี้:
+
+```txt
+fastapi
+uvicorn
+pydantic
+websockets
+MetaTrader5
 ```
 
 ## ตั้งค่า
@@ -82,20 +89,23 @@ python follower.py
 
 - ต่อกับ MT5
 - จำเวลาเริ่มต้นของโปรแกรม
+- เชื่อม WebSocket ไปที่ server
 - ไม่เปิด `open` event ที่เก่ากว่าเวลาเริ่มรัน
-- ดึง event แยกตาม `follower_id`
+- reconnect อัตโนมัติเมื่อ connection หลุด
 
 ## API
 
-ทุก request ต้องส่ง header:
+ทุก REST request ต้องส่ง header:
 
 ```text
 Authorization: Bearer change-me
 ```
 
+## REST API
+
 ### `POST /events`
 
-ใช้ส่ง event เข้า queue
+ใช้ส่ง event เข้า queue และ push ต่อไปยัง follower ที่ออนไลน์อยู่
 
 payload สำหรับเปิด order:
 
@@ -148,29 +158,73 @@ $body = @{
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5990/events" -Headers $headers -Body $body -ContentType "application/json"
 ```
 
-### `GET /pull`
+### `GET /status`
 
-follower ใช้ดึง event ที่ยังไม่ถูก ack โดย `follower_id` นั้น
+ใช้ดูภาพรวมของระบบ เช่น:
 
-ตัวอย่าง:
+- จำนวน event ทั้งหมด
+- จำนวน ack ทั้งหมด
+- จำนวน follower ที่เชื่อมอยู่
+- follower ids ที่ active
+- pending deliveries
+
+### `GET /admin/events`
+
+ใช้ดูรายการ event พร้อม ack ของแต่ละ follower
+
+### `GET /admin/followers`
+
+ใช้ดู follower ที่เชื่อม WebSocket อยู่ในตอนนั้น
+
+## WebSocket
+
+follower ใช้ WebSocket endpoint นี้:
 
 ```text
-GET /pull?follower_id=mt5-01
+ws://host:5990/ws/{follower_id}?token=change-me
 ```
 
-### `POST /ack`
+server จะส่ง message แบบนี้:
 
-follower ใช้ส่งผลลัพธ์กลับ เช่น `done`, `ignored`, `error`
+```json
+{
+  "type": "event",
+  "event": {
+    "event_id": "open-15072",
+    "action": "open",
+    "symbol": "BTCUSD",
+    "side": "sell",
+    "volume": 1,
+    "magic": 0,
+    "timestamp": 1774677300,
+    "sl": 0.0,
+    "tp": 0.0
+  }
+}
+```
+
+follower ส่ง ack กลับแบบนี้:
+
+```json
+{
+  "type": "ack",
+  "event_id": "open-15072",
+  "status": "done",
+  "detail": "opened"
+}
+```
 
 ## หมายเหตุสำคัญ
 
-- `server.py` เก็บ event และ ack ไว้ใน memory เท่านั้น ถ้า server restart ข้อมูลจะหาย
-- การปิด order ฝั่ง follower ตอนนี้ใช้ `symbol` และ `side` เพื่อหา position ล่าสุดที่ตรงกัน
+- `server.py` ตอนนี้เก็บ event และ ack ไว้ใน memory เท่านั้น ถ้า server restart ข้อมูลจะหาย
+- การปิด order ฝั่ง follower ใช้ `symbol` และ `side` เพื่อหา position ล่าสุดที่ตรงกัน
 - ถ้ามีหลาย position ซ้อนกันใน `symbol` และ `side` เดียวกัน อาจปิดไม่ตรงไม้ที่ต้องการ
-- ถ้าเครื่อง follower หลายเครื่องมีชื่อเครื่องซ้ำกัน ควรตั้ง `FOLLOWER_ID` เอง
+- ถ้า follower หลายเครื่องมีชื่อเครื่องซ้ำกัน ควรตั้ง `FOLLOWER_ID` เอง
+- ถ้า MT5 ตอบ `No money` หรือ `retcode=10019` follower จะ mark event เป็น `ignored` เพื่อไม่ให้ retry ซ้ำรัว ๆ
 
 ## ไฟล์ที่ควรรู้
 
 - [server.py](/D:/Coding/MT5_copy_server/server.py)
 - [follower.py](/D:/Coding/MT5_copy_server/follower.py)
+- [requirements.txt](/D:/Coding/MT5_copy_server/requirements.txt)
 - [.gitignore](/D:/Coding/MT5_copy_server/.gitignore)
