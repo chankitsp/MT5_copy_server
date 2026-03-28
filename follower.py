@@ -54,6 +54,14 @@ def save_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def mark_event_processed(state: Dict[str, Any], event_id: str, status: str, detail: str) -> None:
+    if event_id not in state["processed_event_ids"]:
+        state["processed_event_ids"].append(event_id)
+        save_state(state)
+
+    ack_event(event_id, status, detail)
+
+
 def ensure_mt5() -> None:
     if not mt5.initialize():
         raise RuntimeError(f"mt5.initialize() failed: {mt5.last_error()}")
@@ -120,6 +128,11 @@ def ack_event(event_id: str, status: str, detail: str = "") -> None:
 
 def is_stale_open_event(event: Dict[str, Any], started_at: int) -> bool:
     return event["action"] == "open" and event["timestamp"] < started_at
+
+
+def is_non_retryable_error(message: str) -> bool:
+    normalized = message.lower()
+    return "retcode=10019" in normalized or "no money" in normalized
 
 
 def send_market_order(
@@ -294,33 +307,25 @@ def process_event(event: Dict[str, Any], state: Dict[str, Any], started_at: int)
             f"Ignore stale open event {event_id}: "
             f"event_timestamp={event['timestamp']} follower_started_at={started_at}"
         )
-        state["processed_event_ids"].append(event_id)
-        save_state(state)
-        ack_event(event_id, "ignored", "stale_open_before_follower_start")
+        mark_event_processed(state, event_id, "ignored", "stale_open_before_follower_start")
         return
 
     if action == "open":
         process_open(event, state)
-        state["processed_event_ids"].append(event_id)
-        save_state(state)
-        ack_event(event_id, "done", "opened")
+        mark_event_processed(state, event_id, "done", "opened")
 
     elif action == "close":
         close_result = process_close(event, state)
-        state["processed_event_ids"].append(event_id)
-        save_state(state)
 
         if close_result == "closed":
-            ack_event(event_id, "done", "closed")
+            mark_event_processed(state, event_id, "done", "closed")
         elif close_result == "skipped:not_found":
-            ack_event(event_id, "done", "skipped_close_position_not_found")
+            mark_event_processed(state, event_id, "done", "skipped_close_position_not_found")
         else:
-            ack_event(event_id, "done", close_result)
+            mark_event_processed(state, event_id, "done", close_result)
 
     else:
-        state["processed_event_ids"].append(event_id)
-        save_state(state)
-        ack_event(event_id, "ignored", f"unsupported action={action}")
+        mark_event_processed(state, event_id, "ignored", f"unsupported action={action}")
 
 
 def main() -> None:
@@ -338,7 +343,11 @@ def main() -> None:
                 except Exception as e:
                     print("process_event error:", e)
                     try:
-                        ack_event(event["event_id"], "error", str(e))
+                        event_id = str(event["event_id"])
+                        if is_non_retryable_error(str(e)):
+                            mark_event_processed(state, event_id, "ignored", str(e))
+                        else:
+                            ack_event(event_id, "error", str(e))
                     except Exception as ack_err:
                         print("ack_event error:", ack_err)
         except Exception as e:
