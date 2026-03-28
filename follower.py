@@ -1,17 +1,19 @@
-import time
+import asyncio
 import json
 import os
 import socket
-from typing import Dict, Any, Optional
+import time
+from typing import Any, Dict, Optional
 
-import requests
 import MetaTrader5 as mt5
+import websockets
 
 API_BASE = "http://192.168.0.103:5990"
 API_TOKEN = "change-me"
 FOLLOWER_ID = os.getenv("FOLLOWER_ID") or socket.gethostname()
+WS_BASE = API_BASE.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
 
-POLL_SECONDS = 1.0
+RECONNECT_SECONDS = 3.0
 DEVIATION = 20
 MAGIC = 990001
 
@@ -40,6 +42,7 @@ def normalize_event(event: Dict[str, Any]) -> Dict[str, Any]:
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {"processed_event_ids": []}
+
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         state = json.load(f)
 
@@ -54,12 +57,12 @@ def save_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def mark_event_processed(state: Dict[str, Any], event_id: str, status: str, detail: str) -> None:
-    if event_id not in state["processed_event_ids"]:
-        state["processed_event_ids"].append(event_id)
-        save_state(state)
+def mark_event_processed(state: Dict[str, Any], event_id: str) -> None:
+    if event_id in state["processed_event_ids"]:
+        return
 
-    ack_event(event_id, status, detail)
+    state["processed_event_ids"].append(event_id)
+    save_state(state)
 
 
 def ensure_mt5() -> None:
@@ -106,26 +109,6 @@ def normalize_volume(symbol: str, volume: float) -> float:
     return normalized
 
 
-def get_open_events() -> list:
-    headers = {"Authorization": f"Bearer {API_TOKEN}"}
-    params = {"follower_id": FOLLOWER_ID}
-    r = requests.get(f"{API_BASE}/pull", headers=headers, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()["events"]
-
-
-def ack_event(event_id: str, status: str, detail: str = "") -> None:
-    headers = {"Authorization": f"Bearer {API_TOKEN}"}
-    payload = {
-        "event_id": event_id,
-        "follower_id": FOLLOWER_ID,
-        "status": status,
-        "detail": detail,
-    }
-    r = requests.post(f"{API_BASE}/ack", headers=headers, json=payload, timeout=10)
-    r.raise_for_status()
-
-
 def is_stale_open_event(event: Dict[str, Any], started_at: int) -> bool:
     return event["action"] == "open" and event["timestamp"] < started_at
 
@@ -141,7 +124,7 @@ def send_market_order(
     volume: float,
     sl: float,
     tp: float,
-    comment: str
+    comment: str,
 ) -> Optional[int]:
     if not ensure_symbol(symbol):
         return None
@@ -202,7 +185,6 @@ def close_position_by_ticket(ticket: int) -> bool:
         return False
 
     symbol = pos.symbol
-
     if not ensure_symbol(symbol):
         return False
 
@@ -259,7 +241,7 @@ def find_position_to_close(symbol: str, side: str):
     return sorted(matching_positions, key=lambda x: x.time, reverse=True)[0]
 
 
-def process_open(event: Dict[str, Any], state: Dict[str, Any]) -> None:
+def process_open(event: Dict[str, Any]) -> None:
     symbol = resolve_symbol(event["symbol"])
     side = event["side"]
     volume = float(event["volume"]) * LOT_MULTIPLIER
@@ -274,7 +256,7 @@ def process_open(event: Dict[str, Any], state: Dict[str, Any]) -> None:
     print(f"OPENED follower_ticket={follower_ticket} for event_id={event['event_id']}")
 
 
-def process_close(event: Dict[str, Any], state: Dict[str, Any]) -> str:
+def process_close(event: Dict[str, Any]) -> str:
     symbol = resolve_symbol(event["symbol"])
     side = event["side"]
     position = find_position_to_close(symbol, side)
@@ -292,14 +274,28 @@ def process_close(event: Dict[str, Any], state: Dict[str, Any]) -> str:
     return "closed"
 
 
-def process_event(event: Dict[str, Any], state: Dict[str, Any], started_at: int) -> None:
+def websocket_url() -> str:
+    return f"{WS_BASE}/ws/{FOLLOWER_ID}?token={API_TOKEN}"
+
+
+async def send_ack(websocket, event_id: str, status: str, detail: str = "") -> None:
+    payload = {
+        "type": "ack",
+        "event_id": event_id,
+        "status": status,
+        "detail": detail,
+    }
+    await websocket.send(json.dumps(payload))
+
+
+async def process_event(websocket, event: Dict[str, Any], state: Dict[str, Any], started_at: int) -> None:
     event = normalize_event(event)
     event_id = event["event_id"]
     action = event["action"]
 
     if event_id in state["processed_event_ids"]:
         print(f"Skip duplicate event {event_id}")
-        ack_event(event_id, "done", "duplicate_already_processed")
+        await send_ack(websocket, event_id, "done", "duplicate_already_processed")
         return
 
     if is_stale_open_event(event, started_at):
@@ -307,28 +303,33 @@ def process_event(event: Dict[str, Any], state: Dict[str, Any], started_at: int)
             f"Ignore stale open event {event_id}: "
             f"event_timestamp={event['timestamp']} follower_started_at={started_at}"
         )
-        mark_event_processed(state, event_id, "ignored", "stale_open_before_follower_start")
+        mark_event_processed(state, event_id)
+        await send_ack(websocket, event_id, "ignored", "stale_open_before_follower_start")
         return
 
     if action == "open":
-        process_open(event, state)
-        mark_event_processed(state, event_id, "done", "opened")
+        process_open(event)
+        mark_event_processed(state, event_id)
+        await send_ack(websocket, event_id, "done", "opened")
+        return
 
-    elif action == "close":
-        close_result = process_close(event, state)
+    if action == "close":
+        close_result = process_close(event)
+        mark_event_processed(state, event_id)
 
         if close_result == "closed":
-            mark_event_processed(state, event_id, "done", "closed")
+            await send_ack(websocket, event_id, "done", "closed")
         elif close_result == "skipped:not_found":
-            mark_event_processed(state, event_id, "done", "skipped_close_position_not_found")
+            await send_ack(websocket, event_id, "done", "skipped_close_position_not_found")
         else:
-            mark_event_processed(state, event_id, "done", close_result)
+            await send_ack(websocket, event_id, "done", close_result)
+        return
 
-    else:
-        mark_event_processed(state, event_id, "ignored", f"unsupported action={action}")
+    mark_event_processed(state, event_id)
+    await send_ack(websocket, event_id, "ignored", f"unsupported action={action}")
 
 
-def main() -> None:
+async def run_follower() -> None:
     ensure_mt5()
     state = load_state()
     started_at = int(time.time())
@@ -336,24 +337,41 @@ def main() -> None:
 
     while True:
         try:
-            events = get_open_events()
-            for event in events:
-                try:
-                    process_event(event, state, started_at)
-                except Exception as e:
-                    print("process_event error:", e)
-                    try:
-                        event_id = str(event["event_id"])
-                        if is_non_retryable_error(str(e)):
-                            mark_event_processed(state, event_id, "ignored", str(e))
-                        else:
-                            ack_event(event_id, "error", str(e))
-                    except Exception as ack_err:
-                        print("ack_event error:", ack_err)
-        except Exception as e:
-            print("poll error:", e)
+            async with websockets.connect(websocket_url(), ping_interval=20, ping_timeout=20) as websocket:
+                print(f"WebSocket connected follower_id={FOLLOWER_ID}")
 
-        time.sleep(POLL_SECONDS)
+                async for raw_message in websocket:
+                    payload = json.loads(raw_message)
+                    message_type = payload.get("type")
+
+                    if message_type == "welcome":
+                        print(f"Connected to server as follower_id={payload.get('follower_id')}")
+                        continue
+
+                    if message_type != "event":
+                        print(f"Ignore websocket message type={message_type}")
+                        continue
+
+                    event = payload["event"]
+                    try:
+                        await process_event(websocket, event, state, started_at)
+                    except Exception as exc:
+                        print("process_event error:", exc)
+                        event_id = str(event["event_id"])
+                        if is_non_retryable_error(str(exc)):
+                            mark_event_processed(state, event_id)
+                            await send_ack(websocket, event_id, "ignored", str(exc))
+                        else:
+                            await send_ack(websocket, event_id, "error", str(exc))
+
+        except Exception as exc:
+            print("websocket error:", exc)
+
+        await asyncio.sleep(RECONNECT_SECONDS)
+
+
+def main() -> None:
+    asyncio.run(run_follower())
 
 
 if __name__ == "__main__":
